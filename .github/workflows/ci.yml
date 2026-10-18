@@ -124,7 +124,8 @@ jobs:
           podman compose version
 
       - name: Launcher unit tests (Podman command construction and detection)
-        run: node --test packages/run-spaceapp/tests/
+        working-directory: packages/run-spaceapp
+        run: node --test tests/*.test.mjs
 
       - name: Install SpaceApp with rootless Podman
         run: |
