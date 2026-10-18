@@ -18,6 +18,12 @@ import {
   stripTrailingLineEndings
 } from "./string-utils.mjs";
 import { UNIVERSAL_COMMAND } from "./package-info.mjs";
+import {
+  ENGINE_MEMORY_BYTES,
+  assertInstallEngine,
+  engineDisplayName,
+  resolveInstallEngine
+} from "./engine.mjs";
 
 const CONFIG_SCHEMA_VERSION = 4;
 const CONTAINER_SECRET_MODE = 0o644;
@@ -111,6 +117,7 @@ const CONFIG_KEYS = new Set([
   "telemetry",
   "profile",
   "accessMode",
+  "engine",
   "workspaces",
   "companionsEnabled",
   "optionalModules",
@@ -250,7 +257,7 @@ export async function inspectSystemResources(root) {
   };
 }
 
-export function installResourceChecks(resources, profile = "small", { requiredDiskBytes, operation = "fresh" } = {}) {
+export function installResourceChecks(resources, profile = "small", { requiredDiskBytes, operation = "fresh", engine = "docker" } = {}) {
   const cpuCount = Number(resources?.cpuCount);
   const totalMemoryBytes = Number(resources?.totalMemoryBytes);
   const freeDiskBytes = Number(resources?.freeDiskBytes);
@@ -260,7 +267,7 @@ export function installResourceChecks(resources, profile = "small", { requiredDi
   const requirements = PROFILE_REQUIREMENTS[profile];
   if (!requirements) throw new Error("Unknown installation profile.");
   const minFreeDisk = requiredDiskBytes ?? (operation === "fresh" ? requirements.freshDiskBytes : 512 * 1024 ** 2);
-  const engineMemoryBytes = { small: 3, medium: 5, large: 7, light: 3, standard: 3 }[profile] * 1024 ** 3;
+  const engineMemoryBytes = (ENGINE_MEMORY_BYTES[profile] ?? 3) * 1024 ** 3;
   return [
     {
       name: "CPU",
@@ -277,9 +284,9 @@ export function installResourceChecks(resources, profile = "small", { requiredDi
       ok: freeDiskBytes >= minFreeDisk,
       detail: `${formatGibibytes(freeDiskBytes)} GiB available; ${formatGibibytes(minFreeDisk)} GiB required${operation === "fresh" ? "" : " additionally for " + operation}`
     },
-    ...(resources.engineMemoryBytes > 0 ? [{ name: "Docker memory", ok: resources.engineMemoryBytes >= engineMemoryBytes,
+    ...(resources.engineMemoryBytes > 0 ? [{ name: `${engineDisplayName(engine)} memory`, ok: resources.engineMemoryBytes >= engineMemoryBytes,
       detail: `${formatGibibytes(resources.engineMemoryBytes)} GiB allocated; ${formatGibibytes(engineMemoryBytes)} GiB required for ${profile}` }] : []),
-    ...(resources.engineCpuCount > 0 ? [{ name: "Docker CPU", ok: resources.engineCpuCount >= 4,
+    ...(resources.engineCpuCount > 0 ? [{ name: `${engineDisplayName(engine)} CPU`, ok: resources.engineCpuCount >= 4,
       detail: `${resources.engineCpuCount} allocated; 4 required` }] : [])
   ];
 }
@@ -288,13 +295,15 @@ export function createDefaultConfig({
   version,
   profile = "light",
   accessMode = "isolated",
-  companionsEnabled = false
+  companionsEnabled = false,
+  engine
 }) {
   assertVersion(version);
   if (!INSTALL_PROFILES.includes(profile)) {
     throw new Error("Default config requires a resolved installation profile.");
   }
   const resolvedAccessMode = resolveInstallAccessMode(accessMode);
+  const resolvedEngine = resolveInstallEngine(engine);
   return {
     schemaVersion: CONFIG_SCHEMA_VERSION,
     version,
@@ -304,6 +313,9 @@ export function createDefaultConfig({
     telemetry: false,
     profile,
     accessMode: resolvedAccessMode,
+    // Docker is the default engine and is represented by the field's absence,
+    // so configs written by Docker-only launchers stay byte-compatible.
+    ...(resolvedEngine === "docker" ? {} : { engine: resolvedEngine }),
     companionsEnabled,
     optionalModules: "none",
     workspaces: []
@@ -343,6 +355,11 @@ export function validateConfig(config) {
   }
   if (config.accessMode !== "isolated" && config.accessMode !== "host-root") {
     throw new Error("accessMode must be isolated or host-root.");
+  }
+  // Optional: the field is only stored for installations that do not run on
+  // Docker, so an existing Docker-only config stays valid unchanged.
+  if (config.engine !== undefined) {
+    assertInstallEngine(config.engine);
   }
   if (typeof config.companionsEnabled !== "boolean") {
     throw new Error("companionsEnabled must be boolean.");
@@ -577,11 +594,16 @@ export function renderRuntimeEnv(config) {
 
 export function renderWorkspaceCompose(config) {
   validateConfig(config);
+  // Rootless Podman on an SELinux host cannot read a bind mount that carries
+  // the caller's label; ask the compose provider for a private relabel so the
+  // same file still works with Docker.
+  const relabel = config.engine === "podman";
   const mounts = config.workspaces.flatMap((workspace) => [
     "      - type: bind",
     `        source: ${JSON.stringify(workspace.hostPath)}`,
     `        target: ${JSON.stringify(workspace.containerPath)}`,
-    `        read_only: ${workspace.readOnly}`
+    `        read_only: ${workspace.readOnly}`,
+    ...(relabel ? ["        bind:", "          selinux: Z"] : [])
   ]);
   const service = mounts.length > 0
     ? ["    volumes:", ...mounts]
@@ -625,12 +647,36 @@ export function renderHostAccessCompose(config) {
   ].join("\n");
 }
 
+// Podman-only service overrides. On Linux rootless Podman, containers that
+// write into registered workspaces must map the invoking host user to the
+// application uid (10001) so host files stay owned by the user who runs
+// SpaceApp instead of an unmapped subordinate UID. Docker does not need this
+// and keeps using the files the renderer already wrote.
+export function renderEngineCompose(config, platform = process.platform) {
+  validateConfig(config);
+  if (config.engine !== "podman" || platform !== "linux") {
+    return "services: {}\n";
+  }
+  const usernsMode = "keep-id:uid=10001,gid=10001";
+  return [
+    "services:",
+    "  spaceapp-core:",
+    `    userns_mode: "${usernsMode}"`,
+    "  spaceapp-cli:",
+    `    userns_mode: "${usernsMode}"`,
+    "  spaceapp-browser:",
+    `    userns_mode: "${usernsMode}"`,
+    ""
+  ].join("\n");
+}
+
 export function composeCommand(action, root, options = {}) {
   validateHome(root);
   const stateRoot = options.stateRoot ?? root;
   validateHome(stateRoot);
   const profile = options.profile ?? "standard";
   const settings = profileRuntimeSettings(profile);
+  const engine = resolveInstallEngine(options.engine);
   const base = [
     "compose",
     "--project-name", composeProjectName(root),
@@ -639,6 +685,7 @@ export function composeCommand(action, root, options = {}) {
     "-f", join(stateRoot, "compose.yml"),
     "-f", join(stateRoot, "compose.workspaces.yml"),
     "-f", join(stateRoot, "compose.host-access.yml"),
+    ...(engine === "podman" ? ["-f", join(stateRoot, "compose.engine.yml")] : []),
     ...(settings.browserEnabled ? ["--profile", "standard"] : []),
     ...(settings.temporalEnabled ? ["--profile", "workflows"] : []),
     ...(options.companionsEnabled ? ["--profile", "companions"] : [])
@@ -731,7 +778,7 @@ export function composeCommand(action, root, options = {}) {
   if (!selected) {
     throw new Error(`Unsupported Compose action "${action}".`);
   }
-  return { command: "docker", args: [...base, ...selected] };
+  return { command: engine, args: [...base, ...selected] };
 }
 
 export function composeProjectName(root) {
@@ -762,13 +809,15 @@ export async function writeRuntimeFiles(root, config) {
   await atomicWrite(join(root, "runtime.env"), renderRuntimeEnv(config));
   await atomicWrite(join(root, "compose.workspaces.yml"), renderWorkspaceCompose(config));
   await atomicWrite(join(root, "compose.host-access.yml"), renderHostAccessCompose(config));
+  await atomicWrite(join(root, "compose.engine.yml"), renderEngineCompose(config));
 }
 
 export async function prepareInstallation(root, {
   version,
   profile,
   accessMode,
-  companionsEnabled
+  companionsEnabled,
+  engine
 }) {
   validateHome(root);
   await mkdir(root, { recursive: true, mode: 0o700 });
@@ -790,7 +839,8 @@ export async function prepareInstallation(root, {
       version,
       profile: resolvedProfile ?? "light",
       accessMode: resolveInstallAccessMode(accessMode),
-      companionsEnabled
+      companionsEnabled,
+      engine
     });
   }
   if (config.version !== version) {
@@ -809,6 +859,9 @@ export async function prepareInstallation(root, {
   }
   if (companionsEnabled !== undefined && config.companionsEnabled !== companionsEnabled) {
     config = { ...config, companionsEnabled };
+  }
+  if (engine === "podman" && config.engine !== "podman") {
+    config = { ...config, engine: "podman" };
   }
   validateConfig(config);
 

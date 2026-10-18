@@ -60,3 +60,147 @@ jobs:
       - name: Pack launcher candidate
         working-directory: ${{ runner.temp }}/spaceapp-public-export
         run: npm run pack:dry-run -w run-spaceapp
+
+  podman-lifecycle:
+    name: Rootless Podman lifecycle (Linux)
+    runs-on: ubuntu-latest
+    # Exercises the real stack once under rootless Podman:
+    # install --engine podman -> /readyz -> backup -> uninstall --purge-data.
+    # Pulls published images, so it needs more time than the unit suites.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Ensure Podman 5.0+ and the Compose v2 provider
+        run: |
+          set -euo pipefail
+          echo "Preinstalled Podman: $(podman --version 2>/dev/null || echo none)"
+          major="$(podman --version 2>/dev/null | sed -E 's/^[^0-9]*([0-9]+).*/\1/' || true)"
+          if [ -z "${major}" ] || [ "${major}" -lt 5 ]; then
+            # Runners on older LTS images ship Podman 4.x; SpaceApp requires 5.0+.
+            . /etc/os-release
+            curl -fsSL "https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/xUbuntu_${VERSION_ID}/Release.key" \
+              | gpg --dearmor | sudo tee /etc/apt/keyrings/podman-stable.gpg > /dev/null
+            echo "deb [signed-by=/etc/apt/keyrings/podman-stable.gpg] https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/xUbuntu_${VERSION_ID}/ /" \
+              | sudo tee /etc/apt/sources.list.d/podman-stable.list > /dev/null
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq podman
+          fi
+          sudo apt-get install -y -qq uidmap docker-compose-v2
+          podman --version
+          podman compose version
+
+      - name: Prepare rootless Podman for the runner user
+        run: |
+          set -euo pipefail
+          sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
+          # Ubuntu 24.04+ restricts unprivileged user namespaces; rootless
+          # Podman needs them.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          sudo mkdir -p "$XDG_RUNTIME_DIR"
+          sudo chown "$(id -u):$(id -g)" "$XDG_RUNTIME_DIR"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          podman system migrate
+          podman info --format json | python3 -c "import sys,json;i=json.load(sys.stdin);print('rootless:',i['host']['security']['rootless'],'cgroup:',i['host']['cgroupVersion'],'cpus:',i['host']['cpus'])"
+
+      - name: Start the rootless Podman API socket
+        run: |
+          set -euo pipefail
+          mkdir -p "$XDG_RUNTIME_DIR/podman"
+          if ! systemctl --user start podman.socket 2>/dev/null; then
+            setsid podman system service --time=0 </dev/null > "$RUNNER_TEMP/podman-service.log" 2>&1 &
+          fi
+          for attempt in $(seq 1 30); do
+            if [ -S "$XDG_RUNTIME_DIR/podman/podman.sock" ]; then break; fi
+            sleep 1
+          done
+          test -S "$XDG_RUNTIME_DIR/podman/podman.sock"
+          podman compose version
+
+      - name: Launcher unit tests (Podman command construction and detection)
+        run: node --test packages/run-spaceapp/tests/
+
+      - name: Install SpaceApp with rootless Podman
+        run: |
+          set -euo pipefail
+          export SPACEAPP_HOME="$RUNNER_TEMP/spaceapp-podman-home"
+          export SPACEAPP_TELEMETRY=0
+          echo "SPACEAPP_HOME=$SPACEAPP_HOME" >> "$GITHUB_ENV"
+          # The checked-out launcher can be ahead of the newest published
+          # images (for example main preparing a release), so this job runs
+          # against the newest tag published for both SpaceApp images; when
+          # the checked-out version is published, it is used as is.
+          token_for() {
+            curl -fsSL "https://ghcr.io/token?scope=repository%3Aoll4com%2F$1%3Apull&service=ghcr.io" \
+              | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])"
+          }
+          manifest_exists() {
+            curl -fsSL -o /dev/null -H "Authorization: Bearer $(token_for "$1")" \
+              "https://ghcr.io/v2/oll4com/$1/manifests/$2"
+          }
+          tags_for() {
+            curl -fsSL -H "Authorization: Bearer $(token_for "$1")" \
+              "https://ghcr.io/v2/oll4com/$1/tags/list" \
+              | python3 -c "import sys,json;print('\n'.join(json.load(sys.stdin)['tags']))"
+          }
+          expected="$(node -p "require('./packages/run-spaceapp/package.json').spaceappRuntimeVersion")"
+          if manifest_exists spaceapp-core "$expected" && manifest_exists spaceapp-cli "$expected"; then
+            resolved="$expected"
+          else
+            resolved="$(comm -12 <(tags_for spaceapp-core | sort) <(tags_for spaceapp-cli | sort) \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+            test -n "$resolved"
+            node -e 'const fs=require("fs");const file="packages/run-spaceapp/package.json";const pkg=JSON.parse(fs.readFileSync(file,"utf8"));pkg.spaceappRuntimeVersion=process.argv[1];fs.writeFileSync(file,JSON.stringify(pkg,null,2)+"\n");' "$resolved"
+          fi
+          echo "Runtime image tag for this job: $resolved"
+          node packages/run-spaceapp/bin/spaceapp.mjs install \
+            --engine podman --profile small --access isolated --no-open \
+            --non-interactive \
+            --answers '{"confirm":true,"profile":"small","access":"isolated","companions":false,"telemetry":false,"open":false}'
+
+      - name: Wait for /readyz
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:4911/readyz; then
+              echo
+              echo "readyz responded on attempt $attempt"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "readyz did not become ready" >&2
+          podman ps --all
+          exit 1
+
+      - name: Status and logs
+        run: |
+          set -euo pipefail
+          node packages/run-spaceapp/bin/spaceapp.mjs status
+          node packages/run-spaceapp/bin/spaceapp.mjs logs
+
+      - name: Backup
+        run: |
+          set -euo pipefail
+          node packages/run-spaceapp/bin/spaceapp.mjs backup
+          test -n "$(ls -A "$SPACEAPP_HOME/backups")"
+          ls -l "$SPACEAPP_HOME/backups"
+
+      - name: Uninstall with --purge-data
+        run: |
+          set -euo pipefail
+          printf 'DELETE\n' | node packages/run-spaceapp/bin/spaceapp.mjs uninstall --purge-data
+
+      - name: Verify nothing is left running
+        run: |
+          set -euo pipefail
+          podman ps --all
+          test -z "$(podman ps --all -q)"
+          test -z "$(podman volume ls -q)"

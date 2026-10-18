@@ -1,6 +1,6 @@
 # run-spaceapp
 
-Cross-platform Docker launcher for SpaceApp.
+Cross-platform Docker or rootless Podman launcher for SpaceApp.
 
 Run the same command in Linux, macOS, or Windows 11 Command Prompt:
 
@@ -21,7 +21,11 @@ of matching an existing local launcher. If Docker is missing, the universal
 install command automatically installs it from official Docker sources on
 Windows, macOS, Ubuntu, Debian, Fedora, RHEL, and CentOS, or with native
 `pacman` packages on Arch-family Linux including CachyOS. It starts Docker and
-waits for Engine and Compose readiness before pulling images. Windows prefers
+waits for Engine and Compose readiness before pulling images. Docker stays the
+default engine: when Docker is missing but a ready rootless Podman 5.0+ is
+installed, the installer offers to run on Podman instead of installing Docker
+(and picks Podman automatically with `--non-interactive`). Pin the choice with
+`install --engine docker|podman`. Windows prefers
 Windows Package Manager's hash-pinned Docker Desktop
 manifest and retains a signed direct-download fallback. Docker Desktop license
 acceptance still requires confirmation. On Linux, the same command explains
@@ -61,6 +65,30 @@ a conservative estimate is shown. Space is checked again after pulling and
 before pausing writers. Existing data is kept in place; the launcher never deletes
 images, backups or volumes to free space. Separate Docker disk capacity is checked
 when measurable and its availability is reported.
+
+### Container engine
+
+Docker is the default. `install --engine podman` (or `"engine": "podman"` in
+`--answers`) runs the stack with rootless Podman instead:
+
+- **Linux:** Podman 5.0 or newer, the docker-compose v2 provider on `PATH`
+  (`docker-compose-plugin`, or `docker-compose`), and the user socket running
+  (`systemctl --user enable --now podman.socket`). Workspace mounts are
+  relabeled for SELinux (`:Z`) and containers keep your user ID (`keep-id`), so
+  files created by AI CLIs stay owned by you.
+- **macOS:** the Podman machine must be running. Its CPU, memory and disk must
+  meet the selected profile or the installer stops early with
+  `podman machine set --cpus <cpus> --memory <MiB>` guidance.
+- **Windows:** not supported; Docker Desktop is required. Rerun without
+  `--engine podman`.
+
+`doctor` reports the engine, version, rootless/rootful mode, cgroup version and
+whether CPU and memory limits are delegated, plus machine resources on macOS.
+An installation keeps its engine: switching is refused because database,
+workspace and secret volumes are engine-local. To migrate, run `backup`, copy
+the archive off the installation root, `uninstall --purge-data`, install with
+`--engine <other>`, then `restore`. `--access host-root` is Docker-only and is
+refused with Podman before anything runs; Podman installations stay isolated.
 
 ### Telemetry
 
@@ -114,7 +142,7 @@ before enabling it:
 npx --yes run-spaceapp@latest install --access host-root
 ```
 
-Host-root is supported only on Linux. Run
+Host-root is supported only on Linux and requires Docker. Run
 `npx --yes run-spaceapp@latest install --access isolated` to remove the host
 mount while keeping SpaceApp data and volumes.
 
@@ -162,7 +190,7 @@ npx --yes run-spaceapp@latest owner rotate-setup-token
 ```bash
 npx --yes run-spaceapp@latest status         # Check container health and port bindings
 npx --yes run-spaceapp@latest logs           # Show recent container log lines
-npx --yes run-spaceapp@latest doctor         # Verify system prerequisites and diagnose Docker
+npx --yes run-spaceapp@latest doctor         # Verify system prerequisites and diagnose the container engine
 npx --yes run-spaceapp@latest up             # Start containers in background
 npx --yes run-spaceapp@latest down           # Stop containers cleanly
 npx --yes run-spaceapp@latest open           # Open web app in default browser

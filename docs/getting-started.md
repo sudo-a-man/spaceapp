@@ -3,7 +3,11 @@
 SpaceApp packages its application services and redistributable AI coding CLIs
 in Docker. The host needs Node.js only for the small `spaceapp` launcher,
 and enough resources for the stack. The launcher installs and starts Docker
-automatically when it is missing.
+automatically when it is missing. On Linux and macOS you can instead run the
+same stack with rootless Podman by passing `install --engine podman`; when
+Docker is missing and a ready rootless Podman is already installed, the
+installer offers to use it (and picks it automatically with
+`--non-interactive`).
 
 ## Requirements
 
@@ -39,6 +43,28 @@ starts the service. Before adding the current user to the `docker` group, it
 explains that the group grants root-level privileges, adds the user
 automatically, and continues in the same command.
 
+### Rootless Podman on Linux
+
+Pass `install --engine podman` to run the stack under your own user account
+without the root-equivalent `docker` group. The launcher needs Podman 5.0 or
+newer, the docker-compose v2 provider on `PATH` (`docker-compose-plugin`, or
+`docker-compose`), and the user socket:
+
+```bash
+systemctl --user enable --now podman.socket
+npx --yes run-spaceapp@latest install --engine podman
+```
+
+Workspace mounts are relabeled for SELinux (`:Z`) and containers run with
+`keep-id`, so files created by AI CLIs on the host remain owned by you, not
+root. `doctor` reports the Podman version, rootless mode, cgroup version, and
+whether CPU and memory limits are delegated to your user. An existing
+installation keeps its engine; switching between Docker and Podman is refused
+because volumes are engine-local. To migrate later: `backup`, copy the archive
+off the installation root, `uninstall --purge-data`, install with the other
+engine, then `restore`. `--access host-root` is Docker-only and refused with
+Podman; Podman installations use `--access isolated`.
+
 ## macOS
 
 Install Node.js 20.11 or newer, then run in Terminal:
@@ -52,6 +78,24 @@ Desktop's terms, downloads the official architecture-specific DMG, verifies
 its code signature, installs it, starts it, and waits until it is ready. Docker
 Desktop uses its managed lightweight Linux environment. Apple Silicon uses the
 native `linux/arm64` images and Intel Macs use `linux/amd64`.
+
+### Rootless Podman on macOS
+
+With Podman installed (`brew install podman docker-compose`), create and start
+the machine, then install with `--engine podman`:
+
+```bash
+podman machine init && podman machine start
+npx --yes run-spaceapp@latest install --engine podman
+```
+
+The machine is the Linux environment that runs the containers, so its CPU,
+memory, and disk must meet the selected profile. If they are too small, the
+installer stops before pulling images and shows the exact
+`podman machine set --cpus <cpus> --memory <MiB>` command to resize it (stop
+the machine first; disk can only be changed by recreating it). `doctor` reports
+the machine resources next to the profile minima. Windows requires Docker
+Desktop; `--engine podman` is refused there.
 
 ## Windows 11 — Command Prompt
 
@@ -177,8 +221,10 @@ before its visible file size shrinks.
 The universal install command performs
 `initialize → prerequisites → doctor → pull → up → readiness → setup status → open`. It creates
 non-secret configuration, fresh database/session secrets, and a one-time setup
-token; installs Docker from official sources when required; checks CPU, RAM,
-free disk, Docker CLI, Compose, and engine readiness; downloads the selected
+token; installs the container engine from official sources when required
+(Docker by default, or a ready rootless Podman when offered or selected);
+checks CPU, RAM,
+free disk, the engine CLI, Compose, and engine readiness; downloads the selected
 images; starts the services; waits up to ten minutes for `/readyz`; verifies
 first-owner status; and opens `http://127.0.0.1:4911`.
 
@@ -296,9 +342,12 @@ npx --yes run-spaceapp@latest status
 npx --yes run-spaceapp@latest logs
 ```
 
-`doctor` checks Node.js, Docker CLI, Docker Compose, Docker Engine, CPU,
-memory, and free disk exactly once each. It distinguishes a missing CLI or
-Compose plugin from an installed engine that is stopped or inaccessible.
+`doctor` checks Node.js, the container engine CLI (Docker by default, or
+Podman for Podman installations), the Compose provider, and the engine exactly
+once each. It distinguishes a missing CLI or
+Compose plugin from an installed engine that is stopped or inaccessible, and
+reports the engine version, rootless/rootful mode, cgroup version, and limit
+delegation; macOS Podman installations also show Podman machine resources.
 The `small` profile should show core, CLI, and PostgreSQL running; `medium`
 adds Temporal, and `large` also adds the browser service. If startup is still
 in progress, wait for the health checks and inspect bounded logs.

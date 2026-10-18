@@ -92,7 +92,7 @@ Coordinate multi-step tasks conversationally through the Room Agent or speak nat
 - **Hardware**:
   - Minimum (`small` profile): 4 CPU cores, 8 GB-class RAM (at least 7 GiB reported by the operating system), 6.5 GiB free disk.
   - `large` profile (adds the managed browser): 8 CPU cores, 15 GiB RAM, 11 GiB free disk.
-- **Docker**: If Docker is not installed, the installer automatically installs official Docker Desktop (Windows/macOS) or Docker Engine (Linux).
+- **Docker or Podman**: Docker is the default. If Docker is not installed, the installer automatically installs official Docker Desktop (Windows/macOS) or Docker Engine (Linux). On Linux and macOS, pick rootless Podman instead with `install --engine podman`, or accept the offer when Docker is missing and a ready Podman 5.0+ is already installed. Windows requires Docker Desktop.
 
 ### Run the Installation Command
 
@@ -105,7 +105,7 @@ npx --yes run-spaceapp@latest install
 > **Windows 11 Tip**: Use **Command Prompt** (`cmd.exe`) or the Command Prompt profile in Windows Terminal. If PowerShell has a restricted execution policy, run `npx.cmd --yes run-spaceapp@latest install`.
 
 ### What Happens Next (Step-by-Step Onboarding):
-1. **System & Docker Verification**: The launcher verifies CPU, RAM, and disk space, and installs/starts Docker if needed.
+1. **System & Engine Verification**: The launcher verifies CPU, RAM, and disk space, and installs/starts the container engine (Docker by default, or rootless Podman when selected or offered) if needed.
 2. **Container Initialization**: Pulls SpaceApp's images by exact version tag (published with SBOM and provenance attestations that the release workflow verifies) and the third-party images pinned by digest, then starts the container stack.
 3. **One-Time Setup Token**: The terminal prints a secure 15-minute setup token and automatically opens `http://127.0.0.1:4911`.
 4. **Create Your Operator Account**: Paste the token into the setup screen, enter your email and password, and click Create Owner.
