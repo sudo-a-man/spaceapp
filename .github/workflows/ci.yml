@@ -83,18 +83,17 @@ jobs:
           echo "Preinstalled Podman: $(podman --version 2>/dev/null || echo none)"
           major="$(podman --version 2>/dev/null | sed -E 's/^[^0-9]*([0-9]+).*/\1/' || true)"
           if [ -z "${major}" ] || [ "${major}" -lt 5 ]; then
-            # Runners on older LTS images ship Podman 4.x; SpaceApp requires 5.0+.
-            . /etc/os-release
-            curl -fsSL "https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/xUbuntu_${VERSION_ID}/Release.key" \
-              | gpg --dearmor | sudo tee /etc/apt/keyrings/podman-stable.gpg > /dev/null
-            echo "deb [signed-by=/etc/apt/keyrings/podman-stable.gpg] https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/xUbuntu_${VERSION_ID}/ /" \
-              | sudo tee /etc/apt/sources.list.d/podman-stable.list > /dev/null
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq podman
+            # ubuntu-24.04 ships Podman 4.9 and the distribution does not
+            # provide 5.x, so take the static release bundle: podman 6.x with
+            # crun, pasta, netavark, conmon and fuse-overlayfs in /usr/local.
+            curl -fsSL -o "$RUNNER_TEMP/podman-static.tar.gz" \
+              "https://github.com/mgoltzsche/podman-static/releases/download/v6.1.4/podman-linux-amd64.tar.gz"
+            sudo tar -xzf "$RUNNER_TEMP/podman-static.tar.gz" -C / --strip-components=1
           fi
+          sudo apt-get update -qq
           sudo apt-get install -y -qq uidmap docker-compose-v2
+          hash -r
           podman --version
-          podman compose version
 
       - name: Prepare rootless Podman for the runner user
         run: |
