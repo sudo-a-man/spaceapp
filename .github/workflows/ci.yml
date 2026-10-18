@@ -134,6 +134,7 @@ jobs:
         run: node --test tests/*.test.mjs
 
       - name: Install SpaceApp with rootless Podman
+        timeout-minutes: 20
         run: |
           set -euo pipefail
           export SPACEAPP_HOME="$RUNNER_TEMP/spaceapp-podman-home"
@@ -169,7 +170,38 @@ jobs:
           node packages/run-spaceapp/bin/spaceapp.mjs install \
             --engine podman --profile small --access isolated --no-open \
             --non-interactive \
-            --answers '{"confirm":true,"profile":"small","access":"isolated","companions":false,"telemetry":false,"open":false}'
+            --answers '{"confirm":true,"profile":"small","access":"isolated","companions":false,"telemetry":false,"open":false}' &
+          install_pid=$!
+          # Watch the engine while the installer runs; a stall in the compose
+          # dependency wait shows up as containers that never become healthy.
+          for attempt in $(seq 1 60); do
+            sleep 15
+            if ! kill -0 "$install_pid" 2>/dev/null; then break; fi
+            echo "--- engine state at t+$((attempt * 15))s"
+            podman ps --all --format '{{.Names}} {{.Status}}' || true
+          done
+          if kill -0 "$install_pid" 2>/dev/null; then
+            echo "Installer still running after 15 minutes; terminating for diagnostics."
+            kill -TERM "$install_pid" 2>/dev/null || true
+            for attempt in $(seq 1 10); do
+              kill -0 "$install_pid" 2>/dev/null || break
+              sleep 2
+            done
+            kill -KILL "$install_pid" 2>/dev/null || true
+          fi
+          set +e
+          wait "$install_pid"
+          code=$?
+          set -e
+          if [ "$code" -ne 0 ]; then
+            echo "=== install exited with $code"
+            podman ps --all
+            for container in $(podman ps --all -q); do
+              podman inspect --format '{{.Name}} status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container" || true
+              podman logs --tail 120 "$container" 2>&1 || true
+            done
+          fi
+          exit "$code"
 
       - name: Wait for /readyz
         run: |

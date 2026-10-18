@@ -719,6 +719,51 @@ test("--non-interactive picks a ready Podman when Docker is missing", async () =
   assert.equal(stderr.value(), "");
 });
 
+test("an engine preset in --answers selects Podman without offering Docker", async () => {
+  const root = await mkdtemp(join(tmpdir(), "spaceapp-podman-answers-"));
+  const stdout = capture();
+  const stderr = capture();
+  const calls = [];
+  let ensureDockerCalls = 0;
+
+  assert.equal(await run([
+    "install",
+    "--non-interactive",
+    "--answers", installAnswers({ engine: "podman" })
+  ], {
+    env: { SPACEAPP_HOME: root, SPACEAPP_TELEMETRY: "0" },
+    platform: "linux",
+    arch: "x64",
+    stdin: Readable.from([]),
+    stdout: stdout.stream,
+    stderr: stderr.stream,
+    prepareDockerPath: async () => null,
+    inspectResources: async () => linuxResources,
+    ensureDocker: async () => {
+      ensureDockerCalls += 1;
+      return { code: 0, reexecuted: false };
+    },
+    ensurePodman: async () => ({ code: 0, reexecuted: false }),
+    request: readyUnclaimedRequest,
+    sleep: async () => {},
+    execute: async (spec, io) => {
+      calls.push(spec);
+      if (spec.args?.includes("pg_dump")) {
+        io.stdout.write("-- PostgreSQL database dump\nSELECT 1;\n");
+      }
+      return 0;
+    }
+  }), 0);
+
+  assert.equal(ensureDockerCalls, 0);
+  const config = JSON.parse(await readFile(join(root, "config.json"), "utf8"));
+  assert.equal(config.engine, "podman");
+  const composeCalls = calls.filter((spec) => spec.args?.includes("compose"));
+  assert.ok(composeCalls.length >= 2);
+  assert.ok(composeCalls.every((spec) => spec.command === "podman"));
+  assert.equal(stderr.value(), "");
+});
+
 test("install refuses to switch engines on an existing installation", async () => {
   const root = await mkdtemp(join(tmpdir(), "spaceapp-podman-switch-"));
   const calls = [];
