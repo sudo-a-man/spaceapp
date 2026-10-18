@@ -89,11 +89,17 @@ jobs:
             curl -fsSL -o "$RUNNER_TEMP/podman-static.tar.gz" \
               "https://github.com/mgoltzsche/podman-static/releases/download/v6.1.4/podman-linux-amd64.tar.gz"
             sudo tar -xzf "$RUNNER_TEMP/podman-static.tar.gz" -C / --strip-components=1
+            # Ubuntu's crun 1.14 is too old for podman 6.x ("OCI runtime
+            # error: crun: unknown version specified"), so pin the bundled
+            # runtime explicitly and put /usr/local/bin first for later steps.
+            sudo sed -i 's|^\[engine\]$|[engine]\nruntime = "/usr/local/bin/crun"|' /etc/containers/containers.conf
+            echo "/usr/local/bin" >> "$GITHUB_PATH"
           fi
           sudo apt-get update -qq
           sudo apt-get install -y -qq uidmap docker-compose-v2
           hash -r
           podman --version
+          crun --version
 
       - name: Prepare rootless Podman for the runner user
         run: |
@@ -107,7 +113,7 @@ jobs:
           sudo chown "$(id -u):$(id -g)" "$XDG_RUNTIME_DIR"
           echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
           podman system migrate
-          podman info --format json | python3 -c "import sys,json;i=json.load(sys.stdin);print('rootless:',i['host']['security']['rootless'],'cgroup:',i['host']['cgroupVersion'],'cpus:',i['host']['cpus'])"
+          podman info --format json | python3 -c "import sys,json;i=json.load(sys.stdin);r=i['host'].get('ociRuntime') or {};print('rootless:',i['host']['security']['rootless'],'cgroup:',i['host']['cgroupVersion'],'cpus:',i['host']['cpus'],'ociRuntime:',r.get('path'))"
 
       - name: Start the rootless Podman API socket
         run: |
